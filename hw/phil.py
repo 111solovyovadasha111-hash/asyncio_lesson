@@ -3,6 +3,7 @@ from collections import deque
 import re
 from urllib.parse import unquote
 import sys
+import time
 
 try:
     import httpx
