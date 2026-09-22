@@ -1,141 +1,151 @@
 #!/usr/bin/env python3
-
+from collections import deque
 import re
+from urllib.parse import unquote
 import sys
-from collections import defaultdict
-from urllib.request import urlopen
-from urllib.parse import quote, unquote
-from urllib.error import URLError, HTTPError
 
-# 1) Поставить aiohttp/ httpx
-# 2) Взять д/з 3 из прошлого семестра («философия»)
-# 3) Нужно переделать в асинхронный с использованием aiohttp/httpx, сделать бенчмарки
+try:
+    import httpx
+except ModuleNotFoundError:
+    import pip
+    pip.main(['install', '--quiet', 'httpx'])
+    import httpx
 
-CONTENT_START = re.compile(r'<div.*?mw-content-text', re.IGNORECASE)
-DIV_TAG = re.compile(r'<(/?div)', re.IGNORECASE)
-HREF_TAG = re.compile('<a\\s+href=["\']/wiki/([^:#]*?)["\']', re.IGNORECASE)
+
+def equals(a, b):
+    return a.replace('_', ' ').lower() == b.replace('_', ' ').lower()
+
+
+MAX_REQUESTS = 500
+MAX_DEPTH = 7
+DEBUG = True
 
 
 def get_content(name):
+    name = name.replace(' ', '_')
+    url = f'https://ru.wikipedia.org/wiki/{name}'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 '
+                      '(contact: 111solovyovadasha111@gmail.com)',
+        'Accept-Language': 'ru,en;q=0.9',
+    }
     try:
-        with urlopen(f'http://ru.wikipedia.org/wiki/{quote(name)}') as page:
-            return page.read().decode('utf-8', errors='ignore')
-    except (URLError, HTTPError):
+        response = httpx.get(url, headers=headers, follow_redirects=True, timeout=15.0)
+        if DEBUG:
+            print(f'[get_content] {name!r} -> {response.status_code}', file=sys.stderr)
+        response.raise_for_status()
+        return response.text
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        if DEBUG:
+            print(f'[get_content] {name!r} FAILED: {e}', file=sys.stderr)
         return None
 
 
 def extract_content(page):
-    begin = CONTENT_START.search(page)
-    if not begin:
-        return (0, 0)
+    if not page:
+        return 0, 0
+    start = page.find('id="mw-content-text"')
+    end = page.find('id="catlinks"', start)
+    if start == -1:
+        return 0, 0
+    if end == -1:
+        return start, len(page)
+    return start, end
 
-    tags = 1
-    pos = begin.start() + 1
-    while tags:
-        tag = DIV_TAG.search(page, pos)
-        if not tag:
-            return (begin.end(), len(page))
 
-        pos = tag.start() + 1
-        if tag.group(1).startswith('</'):
-            tags -= 1
+def extract_links(page):
+    links = set()
+
+    pattern = r'href=["\']([^"\']+)["\']'
+    matches = re.findall(pattern, page, flags=re.IGNORECASE)
+
+    for href in matches:
+        name = None
+
+        if '/wiki/' in href:
+            name = href.split('/wiki/')[-1]
+        elif href.startswith('./'):
+            name = href[2:]
+
+        if name is None:
+            continue
+
+        if ":" in name:
+            continue
+
+        clean_name = name.split('#')[0].split('?')[0]
+
+        if clean_name:
+            links.add(unquote(clean_name))
+
+    return links
+
+
+def find_chain(start, finish):
+    if equals(start, finish):
+        return [start]
+
+    page = get_content(start)
+    if not page:
+        return None
+
+    queue = deque()
+    queue.append((start, [start]))
+    visited_links = {start.lower().replace('_', ' ')}
+    requests_count = 1
+
+    while queue and requests_count < MAX_REQUESTS:
+        this_page, path = queue.popleft()
+
+        if len(path) > MAX_DEPTH:
+            continue
+
+        if len(path) == 1:
+            content = page
         else:
-            tags += 1
+            content = get_content(this_page)
+            requests_count += 1
 
-    return (begin.end(), pos)
+        if not content:
+            continue
 
+        page_start, page_end = extract_content(content)
+        if page_start == 0 and page_end == 0:
+            continue
 
-def remove_duplicates(iterator):
-    seen = set()
+        links = extract_links(content[page_start:page_end])
 
-    for item in iterator:
-        if item not in seen:
-            yield item
-            seen.add(item)
+        if DEBUG:
+            print(f'[debug] {this_page!r}: links_found={len(links)}', file=sys.stderr)
 
+        for link in links:
+            if equals(link, finish):
+                result = path + [link]
+                return result
 
-def extract_links(page, begin, end):
-    yield from remove_duplicates(
-        unquote(link.group(1))
-        for link in HREF_TAG.finditer(page, begin, end)
-    )
+            good_link = link.lower().replace('_', ' ')
 
+            if good_link not in visited_links:
+                visited_links.add(good_link)
+                queue.append((link, path + [link]))
 
-def build_node(frontier):
-    for name in frontier:
-        page = get_content(name)
-        for link in extract_links(page, *extract_content(page)):
-            yield (name, link)
-
-
-def build_graph(start, finish):
-    graph = defaultdict(set)
-
-    visited = set()
-    frontier = [start]
-
-    cf_finish = finish.casefold()
-    while cf_finish not in (visited | set(frontier)):
-        new_front = []
-
-        for (name, link) in build_node(frontier):
-            visited.add(name.casefold())
-
-            graph[name].add(link)
-            if link.casefold() not in visited:
-                new_front.append(link)
-
-            if link.casefold() == cf_finish:
-                return graph
-
-        frontier = list(remove_duplicates(new_front))
-
-    return graph
-
-
-def _get_track(start, finish, backtrack):
-    track = [finish]
-    pointer = finish
-
-    while pointer != start:
-        pointer = backtrack.get(pointer, start)
-        track.append(pointer)
-
-    return track[::-1]
-
-
-def find_chain(graph, start, finish):
-    visited = set()
-    backtrack = {}
-    queue = [start]
-
-    while queue:
-        top = queue.pop(0)
-
-        for item in graph[top]:
-            if item in visited:
-                continue
-
-            visited.add(item)
-            backtrack[item] = top
-            queue.append(item)
-
-            if item == finish:
-                return _get_track(start, finish, backtrack)
+    return None
 
 
 def main():
     if len(sys.argv) < 2:
-        sys.exit("Start word is not specified")
+        return
 
-    params = (sys.argv[1], 'Философия')
+    start = sys.argv[1]
+    end = "Философия"
+    path = find_chain(start, end)
 
-    graph = build_graph(*params)
-    chain = find_chain(graph, *params)
-    if chain:
-        print('\n'.join(chain))
+    if path:
+        for link in path:
+            print(link)
     else:
-        sys.exit(1)
+        print('Цепочка не найдена', file=sys.stderr)
 
 
 if __name__ == '__main__':
